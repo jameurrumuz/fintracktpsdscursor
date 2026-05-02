@@ -192,6 +192,44 @@ export function subscribeToTransactionsForPartyIds(
   };
 }
 
+export async function generateInvoiceNumber(): Promise<string> {
+  // Simple, globally unique-enough invoice number for client use.
+  return `INV-${Date.now()}`;
+}
+
+export async function createTransaction(transaction: Omit<Transaction, 'id'>): Promise<string> {
+  if (!db) throw new Error('Firebase is not configured.');
+  const payload: any = {
+    ...cleanUndefined(transaction as any),
+    enabled: transaction.enabled ?? true,
+    createdAt: serverTimestamp(),
+  };
+  const ref = await addDoc(collection(db, 'transactions'), payload);
+  return ref.id;
+}
+
+export function subscribeToTransactionsForVerification(
+  staffId: string,
+  onUpdate: (transactions: Transaction[]) => void,
+  onError: (error: Error) => void
+) {
+  const transactionsCollection = getTransactionsCollection();
+  if (!transactionsCollection) return () => {};
+
+  // Current UI only needs "pending" payment verification list.
+  // staffId is kept for API compatibility / future per-staff scoping.
+  const q = query(transactionsCollection, where('paymentStatus', '==', 'pending'));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const transactions = snapshot.docs.map(mapDocToTransaction);
+      transactions.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      onUpdate(transactions);
+    },
+    (error) => onError(error as Error)
+  );
+}
+
 export async function getAllTransactions(): Promise<Transaction[]> {
   const db = getDb();
   if (!db) throw new Error('Firebase is not configured.');
@@ -448,6 +486,14 @@ export async function toggleTransaction(id: string, enabled: boolean): Promise<v
       archivedFromLedger: enabled ? false : true,
     });
     await recalculateBalancesFromTransaction();
+}
+
+export async function recalculateAllPartyBalances(): Promise<number> {
+  const db = getDb();
+  if (!db) throw new Error('Firebase is not configured.');
+  const partiesSnap = await getDocs(collection(db, 'parties'));
+  await recalculateBalancesFromTransaction();
+  return partiesSnap.size;
 }
 
 export async function bulkRestoreTransactions(transactionIds: string[]): Promise<void> {
