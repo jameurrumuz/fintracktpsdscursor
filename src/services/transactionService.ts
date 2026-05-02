@@ -109,6 +109,163 @@ export function subscribeToAllTransactions(
   return unsubscribe;
 }
 
+export function subscribeToTransactionsForParty(
+  partyId: string,
+  onUpdate: (transactions: Transaction[]) => void,
+  onError: (error: Error) => void
+) {
+  const transactionsCollection = getTransactionsCollection();
+  if (!transactionsCollection) return () => {};
+  if (!partyId) {
+    onUpdate([]);
+    return () => {};
+  }
+
+  const q = query(transactionsCollection, where('partyId', '==', partyId));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const transactions = snapshot.docs.map(mapDocToTransaction);
+      transactions.sort((a, b) => {
+        const dateA = new Date(a.date).getTime();
+        const dateB = new Date(b.date).getTime();
+        if (dateA !== dateB) return dateB - dateA;
+        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return timeB - timeA;
+      });
+      onUpdate(transactions);
+    },
+    (error) => onError(error as Error)
+  );
+}
+
+export function subscribeToTransactionsForPartyIds(
+  partyIds: string[],
+  onUpdate: (transactions: Transaction[]) => void,
+  onError: (error: Error) => void
+) {
+  const transactionsCollection = getTransactionsCollection();
+  if (!transactionsCollection) return () => {};
+
+  const uniqueIds = Array.from(new Set((partyIds || []).filter(Boolean)));
+  if (uniqueIds.length === 0) {
+    onUpdate([]);
+    return () => {};
+  }
+
+  // Firestore "in" queries allow up to 10 values.
+  const chunks: string[][] = [];
+  for (let i = 0; i < uniqueIds.length; i += 10) chunks.push(uniqueIds.slice(i, i + 10));
+
+  const chunkResults = new Map<number, Transaction[]>();
+  const emitMerged = () => {
+    const merged = Array.from(chunkResults.values()).flat();
+    const byId = new Map<string, Transaction>();
+    for (const tx of merged) byId.set(tx.id, tx);
+    const deduped = Array.from(byId.values());
+    deduped.sort((a, b) => {
+      const dateA = new Date(a.date).getTime();
+      const dateB = new Date(b.date).getTime();
+      if (dateA !== dateB) return dateB - dateA;
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return timeB - timeA;
+    });
+    onUpdate(deduped);
+  };
+
+  const unsubs = chunks.map((ids, idx) => {
+    const q = query(transactionsCollection, where('partyId', 'in', ids));
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        chunkResults.set(idx, snapshot.docs.map(mapDocToTransaction));
+        emitMerged();
+      },
+      (error) => onError(error as Error)
+    );
+  });
+
+  return () => {
+    unsubs.forEach((u) => u());
+  };
+}
+
+export async function getAllTransactions(): Promise<Transaction[]> {
+  const db = getDb();
+  if (!db) throw new Error('Firebase is not configured.');
+  const snap = await getDocs(query(collection(db, 'transactions')));
+  const transactions = snap.docs.map(mapDocToTransaction);
+  transactions.sort((a, b) => {
+    const dateA = new Date(a.date).getTime();
+    const dateB = new Date(b.date).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    return timeB - timeA;
+  });
+  return transactions;
+}
+
+export async function deleteFilteredTransactions(transactionIds: string[]): Promise<void> {
+  if (!db) throw new Error('Firebase is not configured.');
+  const ids = Array.from(new Set((transactionIds || []).filter(Boolean)));
+  if (ids.length === 0) return;
+
+  // Firestore batches are limited to 500 operations.
+  for (let i = 0; i < ids.length; i += 450) {
+    const batch = writeBatch(db);
+    const chunk = ids.slice(i, i + 450);
+    chunk.forEach((id) =>
+      batch.update(doc(db, 'transactions', id), { enabled: false, archivedFromLedger: true })
+    );
+    await batch.commit();
+  }
+  await recalculateBalancesFromTransaction();
+}
+
+export async function restoreData(data: {
+  parties: any[];
+  transactions: any[];
+  accounts: any[];
+}): Promise<void> {
+  const db = getDb();
+  if (!db) throw new Error('Firebase is not configured.');
+
+  const deleteAllInCollection = async (collectionName: 'transactions' | 'parties' | 'accounts') => {
+    const snap = await getDocs(collection(db, collectionName));
+    const refs = snap.docs.map((d) => d.ref);
+    for (let i = 0; i < refs.length; i += 450) {
+      const batch = writeBatch(db);
+      refs.slice(i, i + 450).forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+  };
+
+  const upsertAll = async (collectionName: 'transactions' | 'parties' | 'accounts', items: any[]) => {
+    const list = Array.isArray(items) ? items : [];
+    for (let i = 0; i < list.length; i += 450) {
+      const batch = writeBatch(db);
+      list.slice(i, i + 450).forEach((item) => {
+        const id = item?.id;
+        if (!id) return;
+        const { id: _, ...rest } = item;
+        batch.set(doc(db, collectionName, String(id)), rest, { merge: false });
+      });
+      await batch.commit();
+    }
+  };
+
+  await deleteAllInCollection('transactions');
+  await deleteAllInCollection('parties');
+  await deleteAllInCollection('accounts');
+
+  await upsertAll('parties', data.parties);
+  await upsertAll('accounts', data.accounts);
+  await upsertAll('transactions', data.transactions);
+}
+
 export async function addTransaction(
     transactionData: Partial<Transaction> & { cart?: any[] }
 ): Promise<string> {
@@ -214,7 +371,9 @@ export async function addTransaction(
         try {
             const saleTransactionForSms: Transaction = { ...baseData, id: mainTxId } as Transaction;
             const paidAmountForSms = (baseData.payments || []).reduce((sum, p) => sum + p.amount, 0) || 0;
-            await handleSmsNotification(saleTransactionForSms, partyDataForSms, paidAmountForSms, initialPartyBalance); 
+            // Don't block the UI/sale completion on external SMS calls.
+            void handleSmsNotification(saleTransactionForSms, partyDataForSms, paidAmountForSms, initialPartyBalance)
+              .catch((error) => console.error("SMS notification failed:", error));
         } catch (error) {
             console.error("SMS notification failed:", error);
         }
@@ -284,8 +443,41 @@ export async function updateTransaction(id: string, updatedData: Partial<Omit<Tr
 
 export async function toggleTransaction(id: string, enabled: boolean): Promise<void> {
     if (!db) throw new Error("Firebase not configured.");
-    await updateDoc(doc(db, 'transactions', id), { enabled });
+    await updateDoc(doc(db, 'transactions', id), {
+      enabled,
+      archivedFromLedger: enabled ? false : true,
+    });
     await recalculateBalancesFromTransaction();
+}
+
+export async function bulkRestoreTransactions(transactionIds: string[]): Promise<void> {
+  const db = getDb();
+  if (!db) throw new Error('Firebase is not configured.');
+  const ids = Array.from(new Set((transactionIds || []).filter(Boolean)));
+  if (ids.length === 0) return;
+  for (let i = 0; i < ids.length; i += 450) {
+    const batch = writeBatch(db);
+    const chunk = ids.slice(i, i + 450);
+    chunk.forEach((id) =>
+      batch.update(doc(db, 'transactions', id), { enabled: true, archivedFromLedger: false })
+    );
+    await batch.commit();
+  }
+  await recalculateBalancesFromTransaction();
+}
+
+export async function bulkDeleteTransactions(transactionIds: string[]): Promise<void> {
+  const db = getDb();
+  if (!db) throw new Error('Firebase is not configured.');
+  const ids = Array.from(new Set((transactionIds || []).filter(Boolean)));
+  if (ids.length === 0) return;
+  for (let i = 0; i < ids.length; i += 450) {
+    const batch = writeBatch(db);
+    const chunk = ids.slice(i, i + 450);
+    chunk.forEach((id) => batch.delete(doc(db, 'transactions', id)));
+    await batch.commit();
+  }
+  await recalculateBalancesFromTransaction();
 }
 
 export async function deleteTransaction(id: string): Promise<void> {
@@ -493,14 +685,31 @@ export async function markTransactionsAsReviewed(ids: string[], note: string): P
     await batch.commit();
 }
 
-export async function subscribeToPendingPayments(onUpdate: (pending: Transaction[]) => void, onError: (error: Error) => void) {
-    if (!db) return () => {};
-    const q = query(collection(db, 'transactions'), where('paymentStatus', '==', 'pending'));
-    return onSnapshot(q, (snap) => onUpdate(snap.docs.map(mapDocToTransaction)), onError);
+export function subscribeToPendingPayments(
+  onUpdate: (pending: Transaction[]) => void,
+  onError: (error: Error) => void
+) {
+  if (!db) return () => {};
+  const q = query(collection(db, 'transactions'), where('paymentStatus', '==', 'pending'));
+  return onSnapshot(q, (snap) => onUpdate(snap.docs.map(mapDocToTransaction)), onError);
 }
 
-export async function subscribeToNewOnlineOrders(onUpdate: (orders: Transaction[]) => void, onError: (error: Error) => void) {
-    if (!db) return () => {};
-    const q = query(collection(db, 'transactions'), where('adminNotified', '==', false), where('description', '>=', 'Purchase from Online Store'));
-    return onSnapshot(q, (snap) => onUpdate(snap.docs.map(mapDocToTransaction).filter(t => t.description.includes('Online Store'))), onError);
+export function subscribeToNewOnlineOrders(
+  onUpdate: (orders: Transaction[]) => void,
+  onError: (error: Error) => void
+) {
+  if (!db) return () => {};
+  // Avoid composite-index requirements by querying the minimal predicate,
+  // then filtering on the client.
+  const q = query(collection(db, 'transactions'), where('adminNotified', '==', false));
+  return onSnapshot(
+    q,
+    (snap) =>
+      onUpdate(
+        snap.docs
+          .map(mapDocToTransaction)
+          .filter((t) => (t.description || '').includes('Online Store'))
+      ),
+    onError
+  );
 }

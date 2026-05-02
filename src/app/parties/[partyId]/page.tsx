@@ -283,6 +283,16 @@ function PartyLedgerPageContent({ params: paramsPromise }: { params: Promise<{ p
   const [selectedSms, setSelectedSms] = useState<Set<string>>(new Set());
   const [sendSms, setSendSms] = useState(true);
 
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
+  const [viewingReceipt, setViewingReceipt] = useState<Transaction | null>(null);
+  const [viewingInvoice, setViewingInvoice] = useState<Transaction | null>(null);
+  const [payingInstallment, setPayingInstallment] = useState<{
+    loanId: string;
+    installment: AmortizationEntry;
+    index: number;
+  } | null>(null);
+  const [editingLoan, setEditingLoan] = useState<Loan | null>(null);
+
   useEffect(() => {
     if (partyId) {
         setLoading(true);
@@ -770,7 +780,7 @@ function PartyLedgerPageContent({ params: paramsPromise }: { params: Promise<{ p
 export default function PartyLedgerPageWrapper(props: { params: Promise<{ partyId: string }> }) {
   return (
     <Suspense fallback={<div className="flex justify-center items-center h-screen"><Loader2 className="animate-spin text-primary" /></div>}>
-      <PartyLedgerPage {...props} />
+      <PartyLedgerPageContent params={props.params} />
     </Suspense>
   );
 }

@@ -20,6 +20,14 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { Checkbox } from '@/components/ui/checkbox';
 import { format as formatFns, startOfMonth } from 'date-fns';
 
+/** Hide broken/partial Firestore docs that were never a real ledger entry */
+function isCompleteTransactionForActivityLog(t: Transaction): boolean {
+  if (!t.date || !t.type) return false;
+  if (typeof t.amount !== 'number' || Number.isNaN(t.amount)) return false;
+  if (String(t.description ?? '').trim().length === 0) return false;
+  return true;
+}
+
 export default function ActivityLogPage() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
@@ -32,7 +40,8 @@ export default function ActivityLogPage() {
       dateFrom: formatFns(monthStart, 'yyyy-MM-dd'),
       dateTo: formatFns(today, 'yyyy-MM-dd'),
       type: 'all',
-      status: 'all' as 'all' | 'enabled' | 'disabled',
+      /** Default: disabled / archived rows only — this screen is for review & cleanup */
+      status: 'disabled' as 'all' | 'enabled' | 'disabled',
     };
   });
   
@@ -56,16 +65,19 @@ export default function ActivityLogPage() {
   }, [toast]);
 
   const filteredTransactions = useMemo(() => {
-    return transactions.filter(t => {
-      if (filters.dateFrom && t.date < filters.dateFrom) return false;
-      if (filters.dateTo && t.date > filters.dateTo) return false;
-      if (filters.type !== 'all' && t.type !== filters.type) return false;
-      if (filters.status !== 'all') {
-        if (filters.status === 'enabled' && !t.enabled) return false;
-        if (filters.status === 'disabled' && t.enabled) return false;
-      }
-      return true;
-    }).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    return transactions
+      .filter((t) => {
+        if (!isCompleteTransactionForActivityLog(t)) return false;
+        if (filters.dateFrom && t.date < filters.dateFrom) return false;
+        if (filters.dateTo && t.date > filters.dateTo) return false;
+        if (filters.type !== 'all' && t.type !== filters.type) return false;
+        if (filters.status !== 'all') {
+          if (filters.status === 'enabled' && !t.enabled) return false;
+          if (filters.status === 'disabled' && t.enabled) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   }, [transactions, filters]);
   
   const handleFilterChange = (updates: Partial<typeof filters>) => {
@@ -125,7 +137,10 @@ export default function ActivityLogPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-3 text-2xl"><History /> Activity Log</CardTitle>
-          <CardDescription>View all system activities and transactions. You can restore disabled entries or permanently delete them.</CardDescription>
+          <CardDescription>
+            Review disabled (archived) transactions and permanently remove them if needed. Incomplete records that were never valid entries are hidden.
+            Use Status &quot;All&quot; to include enabled rows in the date range.
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6 p-4 border rounded-lg">

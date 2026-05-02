@@ -76,6 +76,8 @@ export interface Transaction {
   suspicionReviewed?: boolean;
   suspicionReviewNote?: string;
   adminNotified?: boolean;
+  /** Set when a transaction is disabled via the app (ledger / activity log path), not incomplete writes */
+  archivedFromLedger?: boolean;
 }
 
 export interface AmortizationEntry {
